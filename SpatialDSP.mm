@@ -450,7 +450,7 @@ static OSStatus hooked_AudioUnitSetProperty(
             return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
         }
 
-        if (cb->inputProc != HookedRenderCallback) {
+        if ((const void *)cb->inputProc != (const void *)HookedRenderCallback) {
             SpatialUnitState *st = FindOrCreateState(inUnit, inElement);
             if (st) {
                 st->origProc   = cb->inputProc;
@@ -458,7 +458,7 @@ static OSStatus hooked_AudioUnitSetProperty(
                 RefreshStreamFormat(st, inUnit, inElement, NULL);
 
                 AURenderCallbackStruct replacement;
-                replacement.inputProc       = HookedRenderCallback;
+                replacement.inputProc       = (AURenderCallback)HookedRenderCallback;
                 replacement.inputProcRefCon = st;
 
                 pthread_mutex_unlock(&gLock);
