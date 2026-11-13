@@ -1,0 +1,25 @@
+name: Build ApplePro2 SpatialDSP dylibs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch fishhook
+        run: git clone --depth 1 https://github.com/facebook/fishhook.git
+
+      - name: Build ARM64 iOS dylibs
+        run: make
+
+      - name: Upload dylib artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApplePro2-SpatialDSP-dylibs
+          path: "*.dylib"
