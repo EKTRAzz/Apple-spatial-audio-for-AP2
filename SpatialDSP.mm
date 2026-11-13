@@ -11,7 +11,10 @@
 #define SPATIAL_MODE 1 // 1=HeSuVi Matrix Upmix, 2=Pure Front Stereo
 #endif
 
-#define MAX_FRAMES 4096
+#define FFT_N       8192
+#define FFT_HALF    4096
+#define FFT_LOG2    13
+#define MAX_SLOTS   32
 
 struct SpatialUnitState {
     AudioUnit unit;
@@ -23,18 +26,45 @@ struct SpatialUnitState {
     bool isNonInterleaved;
     bool valid;
 
-    float histL[SPATIAL_IR_LEN + MAX_FRAMES];
-    float histR[SPATIAL_IR_LEN + MAX_FRAMES];
-    float outLL[MAX_FRAMES];
-    float outLR[MAX_FRAMES];
-    float outRL[MAX_FRAMES];
-    float outRR[MAX_FRAMES];
-    float tmpL[MAX_FRAMES];
-    float tmpR[MAX_FRAMES];
+    float histL[FFT_N];
+    float histR[FFT_N];
+
+    float tmpInL[FFT_HALF];
+    float tmpInR[FFT_HALF];
+
+    float xLr[FFT_HALF];
+    float xLi[FFT_HALF];
+    float xRr[FFT_HALF];
+    float xRi[FFT_HALF];
+
+    float yLr[FFT_HALF];
+    float yLi[FFT_HALF];
+    float yRr[FFT_HALF];
+    float yRi[FFT_HALF];
+
+    float accLr[FFT_HALF];
+    float accLi[FFT_HALF];
+    float accRr[FFT_HALF];
+    float accRi[FFT_HALF];
+
+    float timeOutL[FFT_N];
+    float timeOutR[FFT_N];
 };
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
-static SpatialUnitState gStates[16];
+static SpatialUnitState gStates[MAX_SLOTS];
+static FFTSetup gFftSetup = NULL;
+
+// Precomputed IR spectra (44.1 kHz & 48 kHz)
+struct IRSpectra {
+    float ll_r[FFT_HALF], ll_i[FFT_HALF];
+    float lr_r[FFT_HALF], lr_i[FFT_HALF];
+    float rl_r[FFT_HALF], rl_i[FFT_HALF];
+    float rr_r[FFT_HALF], rr_i[FFT_HALF];
+};
+static IRSpectra gSpec44;
+static IRSpectra gSpec48;
+
 static OSStatus (*orig_AudioUnitSetProperty)(
     AudioUnit inUnit,
     AudioUnitPropertyID inID,
@@ -44,15 +74,56 @@ static OSStatus (*orig_AudioUnitSetProperty)(
     UInt32 inDataSize
 ) = NULL;
 
+static OSStatus (*orig_AudioComponentInstanceDispose)(
+    AudioComponentInstance inInstance
+) = NULL;
+
+static void PrecomputeOneIR(const float *ir, float *outR, float *outI) {
+    float padded[FFT_N];
+    memset(padded, 0, sizeof(padded));
+    memcpy(padded, ir, SPATIAL_IR_LEN * sizeof(float));
+
+    DSPSplitComplex split = { outR, outI };
+    vDSP_ctoz((const DSPComplex *)padded, 2, &split, 1, FFT_HALF);
+    vDSP_fft_zrip(gFftSetup, &split, 1, FFT_LOG2, FFT_FORWARD);
+}
+
+static void InitAllSpectra(void) {
+    gFftSetup = vDSP_create_fftsetup(FFT_LOG2, kFFTRadix2);
+    if (!gFftSetup) return;
+
+#if SPATIAL_MODE == 2
+    PrecomputeOneIR(IR_FRONT_44100_LL, gSpec44.ll_r, gSpec44.ll_i);
+    PrecomputeOneIR(IR_FRONT_44100_LR, gSpec44.lr_r, gSpec44.lr_i);
+    PrecomputeOneIR(IR_FRONT_44100_RL, gSpec44.rl_r, gSpec44.rl_i);
+    PrecomputeOneIR(IR_FRONT_44100_RR, gSpec44.rr_r, gSpec44.rr_i);
+
+    PrecomputeOneIR(IR_FRONT_48000_LL, gSpec48.ll_r, gSpec48.ll_i);
+    PrecomputeOneIR(IR_FRONT_48000_LR, gSpec48.lr_r, gSpec48.lr_i);
+    PrecomputeOneIR(IR_FRONT_48000_RL, gSpec48.rl_r, gSpec48.rl_i);
+    PrecomputeOneIR(IR_FRONT_48000_RR, gSpec48.rr_r, gSpec48.rr_i);
+#else
+    PrecomputeOneIR(IR_MATRIX_44100_LL, gSpec44.ll_r, gSpec44.ll_i);
+    PrecomputeOneIR(IR_MATRIX_44100_LR, gSpec44.lr_r, gSpec44.lr_i);
+    PrecomputeOneIR(IR_MATRIX_44100_RL, gSpec44.rl_r, gSpec44.rl_i);
+    PrecomputeOneIR(IR_MATRIX_44100_RR, gSpec44.rr_r, gSpec44.rr_i);
+
+    PrecomputeOneIR(IR_MATRIX_48000_LL, gSpec48.ll_r, gSpec48.ll_i);
+    PrecomputeOneIR(IR_MATRIX_48000_LR, gSpec48.lr_r, gSpec48.lr_i);
+    PrecomputeOneIR(IR_MATRIX_48000_RL, gSpec48.rl_r, gSpec48.rl_i);
+    PrecomputeOneIR(IR_MATRIX_48000_RR, gSpec48.rr_r, gSpec48.rr_i);
+#endif
+}
+
 static SpatialUnitState* FindOrCreateState(AudioUnit unit) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < MAX_SLOTS; i++) {
         if (gStates[i].valid && gStates[i].unit == unit) return &gStates[i];
     }
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < MAX_SLOTS; i++) {
         if (!gStates[i].valid) {
             memset(&gStates[i], 0, sizeof(SpatialUnitState));
             gStates[i].unit = unit;
-            gStates[i].sampleRate = 48000.0;
+            gStates[i].sampleRate = 44100.0;
             gStates[i].channels = 2;
             gStates[i].isFloat = true;
             gStates[i].isNonInterleaved = true;
@@ -63,51 +134,86 @@ static SpatialUnitState* FindOrCreateState(AudioUnit unit) {
     return NULL;
 }
 
-static void SelectTrueStereoIR(double sampleRate, const float **ll, const float **lr, const float **rl, const float **rr) {
-    bool is48 = (sampleRate >= 46000.0);
-#if SPATIAL_MODE == 2
-    *ll = is48 ? IR_FRONT_48000_LL : IR_FRONT_44100_LL;
-    *lr = is48 ? IR_FRONT_48000_LR : IR_FRONT_44100_LR;
-    *rl = is48 ? IR_FRONT_48000_RL : IR_FRONT_44100_RL;
-    *rr = is48 ? IR_FRONT_48000_RR : IR_FRONT_44100_RR;
-#else
-    *ll = is48 ? IR_MATRIX_48000_LL : IR_MATRIX_44100_LL;
-    *lr = is48 ? IR_MATRIX_48000_LR : IR_MATRIX_44100_LR;
-    *rl = is48 ? IR_MATRIX_48000_RL : IR_MATRIX_44100_RL;
-    *rr = is48 ? IR_MATRIX_48000_RR : IR_MATRIX_44100_RR;
-#endif
+static inline void PackedComplexMul(
+    const DSPSplitComplex *A,
+    const float *Br,
+    const float *Bi,
+    DSPSplitComplex *C
+) {
+    DSPSplitComplex B = { (float *)Br, (float *)Bi };
+    float dc = A->realp[0] * Br[0];
+    float nyq = A->imagp[0] * Bi[0];
+    vDSP_zvmul(A, 1, &B, 1, C, 1, FFT_HALF, 1);
+    C->realp[0] = dc;
+    C->imagp[0] = nyq;
+}
+
+static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32 chunk) {
+    if (!gFftSetup || chunk == 0 || chunk > FFT_HALF) return;
+
+    const IRSpectra *spec = (st->sampleRate >= 46000.0) ? &gSpec48 : &gSpec44;
+
+    // Overlap-Save: shift history left by chunk, append new chunk at end
+    memmove(st->histL, st->histL + chunk, (FFT_N - chunk) * sizeof(float));
+    memcpy(st->histL + (FFT_N - chunk), inL, chunk * sizeof(float));
+
+    memmove(st->histR, st->histR + chunk, (FFT_N - chunk) * sizeof(float));
+    memcpy(st->histR + (FFT_N - chunk), inR, chunk * sizeof(float));
+
+    DSPSplitComplex xL = { st->xLr, st->xLi };
+    DSPSplitComplex xR = { st->xRr, st->xRi };
+    vDSP_ctoz((const DSPComplex *)st->histL, 2, &xL, 1, FFT_HALF);
+    vDSP_ctoz((const DSPComplex *)st->histR, 2, &xR, 1, FFT_HALF);
+    vDSP_fft_zrip(gFftSetup, &xL, 1, FFT_LOG2, FFT_FORWARD);
+    vDSP_fft_zrip(gFftSetup, &xR, 1, FFT_LOG2, FFT_FORWARD);
+
+    DSPSplitComplex yL = { st->yLr, st->yLi };
+    DSPSplitComplex yR = { st->yRr, st->yRi };
+    DSPSplitComplex accL = { st->accLr, st->accLi };
+    DSPSplitComplex accR = { st->accRr, st->accRi };
+
+    // L_out = X_L * LL + X_R * RL (summed in frequency domain before single IFFT)
+    PackedComplexMul(&xL, spec->ll_r, spec->ll_i, &accL);
+    PackedComplexMul(&xR, spec->rl_r, spec->rl_i, &yL);
+    vDSP_zvadd(&accL, 1, &yL, 1, &accL, 1, FFT_HALF);
+
+    // R_out = X_L * LR + X_R * RR
+    PackedComplexMul(&xL, spec->lr_r, spec->lr_i, &accR);
+    PackedComplexMul(&xR, spec->rr_r, spec->rr_i, &yR);
+    vDSP_zvadd(&accR, 1, &yR, 1, &accR, 1, FFT_HALF);
+
+    vDSP_fft_zrip(gFftSetup, &accL, 1, FFT_LOG2, FFT_INVERSE);
+    vDSP_fft_zrip(gFftSetup, &accR, 1, FFT_LOG2, FFT_INVERSE);
+
+    vDSP_ztoc(&accL, 1, (DSPComplex *)st->timeOutL, 2, FFT_HALF);
+    vDSP_ztoc(&accR, 1, (DSPComplex *)st->timeOutR, 2, FFT_HALF);
+
+    // Scale by 1 / (8 * FFT_N) and copy valid tail [FFT_N - chunk .. FFT_N - 1]
+    const float scale = 1.0f / (8.0f * (float)FFT_N);
+    float *validL = st->timeOutL + (FFT_N - chunk);
+    float *validR = st->timeOutR + (FFT_N - chunk);
+    vDSP_vsmul(validL, 1, &scale, inL, 1, chunk);
+    vDSP_vsmul(validR, 1, &scale, inR, 1, chunk);
+
+    for (UInt32 i = 0; i < chunk; i++) {
+        float l = inL[i];
+        float r = inR[i];
+        if (l > 0.96f) l = 0.96f + 0.03f * tanhf((l - 0.96f) * 33.0f);
+        else if (l < -0.96f) l = -0.96f + 0.03f * tanhf((l + 0.96f) * 33.0f);
+        if (r > 0.96f) r = 0.96f + 0.03f * tanhf((r - 0.96f) * 33.0f);
+        else if (r < -0.96f) r = -0.96f + 0.03f * tanhf((r + 0.96f) * 33.0f);
+        inL[i] = l;
+        inR[i] = r;
+    }
 }
 
 static void ProcessTrueStereo(SpatialUnitState *st, float *inL, float *inR, UInt32 nFrames) {
-    if (nFrames == 0 || nFrames > MAX_FRAMES) return;
-
-    const float *ll, *lr, *rl, *rr;
-    SelectTrueStereoIR(st->sampleRate, &ll, &lr, &rl, &rr);
-
-    memmove(st->histL, st->histL + nFrames, (SPATIAL_IR_LEN - 1) * sizeof(float));
-    memcpy(st->histL + (SPATIAL_IR_LEN - 1), inL, nFrames * sizeof(float));
-
-    memmove(st->histR, st->histR + nFrames, (SPATIAL_IR_LEN - 1) * sizeof(float));
-    memcpy(st->histR + (SPATIAL_IR_LEN - 1), inR, nFrames * sizeof(float));
-
-    // True-Stereo 4-path convolution: L_out = L*LL + R*RL, R_out = L*LR + R*RR
-    vDSP_conv(st->histL, 1, ll + (SPATIAL_IR_LEN - 1), -1, st->outLL, 1, nFrames, SPATIAL_IR_LEN);
-    vDSP_conv(st->histR, 1, rl + (SPATIAL_IR_LEN - 1), -1, st->outRL, 1, nFrames, SPATIAL_IR_LEN);
-    vDSP_conv(st->histL, 1, lr + (SPATIAL_IR_LEN - 1), -1, st->outLR, 1, nFrames, SPATIAL_IR_LEN);
-    vDSP_conv(st->histR, 1, rr + (SPATIAL_IR_LEN - 1), -1, st->outRR, 1, nFrames, SPATIAL_IR_LEN);
-
-    vDSP_vadd(st->outLL, 1, st->outRL, 1, inL, 1, nFrames);
-    vDSP_vadd(st->outLR, 1, st->outRR, 1, inR, 1, nFrames);
-
-    for (UInt32 i = 0; i < nFrames; i++) {
-        float l = inL[i];
-        float r = inR[i];
-        if (l > 0.98f) l = 0.98f + 0.02f * tanhf((l - 0.98f) * 50.0f);
-        else if (l < -0.98f) l = -0.98f + 0.02f * tanhf((l + 0.98f) * 50.0f);
-        if (r > 0.98f) r = 0.98f + 0.02f * tanhf((r - 0.98f) * 50.0f);
-        else if (r < -0.98f) r = -0.98f + 0.02f * tanhf((r + 0.98f) * 50.0f);
-        inL[i] = l;
-        inR[i] = r;
+    UInt32 offset = 0;
+    while (offset < nFrames) {
+        UInt32 chunk = nFrames - offset;
+        if (chunk > FFT_HALF) chunk = FFT_HALF;
+        ProcessFFTChunk(st, inL + offset, inR + offset, chunk);
+        offset += chunk;
     }
 }
 
@@ -123,44 +229,58 @@ static OSStatus HookedRenderCallback(
     if (!st || !st->origProc) return noErr;
 
     OSStatus err = st->origProc(st->origRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    if (err != noErr || !ioData || inNumberFrames == 0 || inNumberFrames > MAX_FRAMES) return err;
+    if (err != noErr || !ioData || inNumberFrames == 0 || !st->valid || st->channels != 2) return err;
     if (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence)) return err;
 
     if (st->isFloat) {
         if (st->isNonInterleaved && ioData->mNumberBuffers >= 2) {
             float *bufL = (float *)ioData->mBuffers[0].mData;
             float *bufR = (float *)ioData->mBuffers[1].mData;
-            if (bufL && bufR) ProcessTrueStereo(st, bufL, bufR, inNumberFrames);
-        } else if (!st->isNonInterleaved && ioData->mNumberBuffers >= 1 && st->channels == 2) {
+            if (bufL && bufR && ioData->mBuffers[0].mDataByteSize >= inNumberFrames * sizeof(float)) {
+                ProcessTrueStereo(st, bufL, bufR, inNumberFrames);
+            }
+        } else if (!st->isNonInterleaved && ioData->mNumberBuffers >= 1) {
             float *inter = (float *)ioData->mBuffers[0].mData;
-            if (inter) {
-                for (UInt32 i = 0; i < inNumberFrames; i++) {
-                    st->tmpL[i] = inter[2 * i];
-                    st->tmpR[i] = inter[2 * i + 1];
-                }
-                ProcessTrueStereo(st, st->tmpL, st->tmpR, inNumberFrames);
-                for (UInt32 i = 0; i < inNumberFrames; i++) {
-                    inter[2 * i] = st->tmpL[i];
-                    inter[2 * i + 1] = st->tmpR[i];
+            if (inter && ioData->mBuffers[0].mDataByteSize >= inNumberFrames * 2 * sizeof(float)) {
+                UInt32 offset = 0;
+                while (offset < inNumberFrames) {
+                    UInt32 chunk = inNumberFrames - offset;
+                    if (chunk > FFT_HALF) chunk = FFT_HALF;
+                    for (UInt32 i = 0; i < chunk; i++) {
+                        st->tmpInL[i] = inter[2 * (offset + i)];
+                        st->tmpInR[i] = inter[2 * (offset + i) + 1];
+                    }
+                    ProcessFFTChunk(st, st->tmpInL, st->tmpInR, chunk);
+                    for (UInt32 i = 0; i < chunk; i++) {
+                        inter[2 * (offset + i)] = st->tmpInL[i];
+                        inter[2 * (offset + i) + 1] = st->tmpInR[i];
+                    }
+                    offset += chunk;
                 }
             }
         }
-    } else if (!st->isFloat && !st->isNonInterleaved && ioData->mNumberBuffers >= 1 && st->channels == 2) {
+    } else if (!st->isFloat && !st->isNonInterleaved && ioData->mNumberBuffers >= 1) {
         int16_t *pcm = (int16_t *)ioData->mBuffers[0].mData;
-        if (pcm) {
+        if (pcm && ioData->mBuffers[0].mDataByteSize >= inNumberFrames * 2 * sizeof(int16_t)) {
             const float inv = 1.0f / 32768.0f;
-            for (UInt32 i = 0; i < inNumberFrames; i++) {
-                st->tmpL[i] = pcm[2 * i] * inv;
-                st->tmpR[i] = pcm[2 * i + 1] * inv;
-            }
-            ProcessTrueStereo(st, st->tmpL, st->tmpR, inNumberFrames);
-            for (UInt32 i = 0; i < inNumberFrames; i++) {
-                float l = st->tmpL[i] * 32767.0f;
-                float r = st->tmpR[i] * 32767.0f;
-                if (l > 32767.0f) l = 32767.0f; else if (l < -32768.0f) l = -32768.0f;
-                if (r > 32767.0f) r = 32767.0f; else if (r < -32768.0f) r = -32768.0f;
-                pcm[2 * i] = (int16_t)l;
-                pcm[2 * i + 1] = (int16_t)r;
+            UInt32 offset = 0;
+            while (offset < inNumberFrames) {
+                UInt32 chunk = inNumberFrames - offset;
+                if (chunk > FFT_HALF) chunk = FFT_HALF;
+                for (UInt32 i = 0; i < chunk; i++) {
+                    st->tmpInL[i] = pcm[2 * (offset + i)] * inv;
+                    st->tmpInR[i] = pcm[2 * (offset + i) + 1] * inv;
+                }
+                ProcessFFTChunk(st, st->tmpInL, st->tmpInR, chunk);
+                for (UInt32 i = 0; i < chunk; i++) {
+                    float l = st->tmpInL[i] * 32767.0f;
+                    float r = st->tmpInR[i] * 32767.0f;
+                    if (l > 32767.0f) l = 32767.0f; else if (l < -32768.0f) l = -32768.0f;
+                    if (r > 32767.0f) r = 32767.0f; else if (r < -32768.0f) r = -32768.0f;
+                    pcm[2 * (offset + i)] = (int16_t)l;
+                    pcm[2 * (offset + i) + 1] = (int16_t)r;
+                }
+                offset += chunk;
             }
         }
     }
@@ -179,8 +299,8 @@ static OSStatus hooked_AudioUnitSetProperty(
         const AudioStreamBasicDescription *asbd = (const AudioStreamBasicDescription *)inData;
         pthread_mutex_lock(&gLock);
         SpatialUnitState *st = FindOrCreateState(inUnit);
-        if (st && asbd->mChannelsPerFrame == 2) {
-            st->sampleRate = asbd->mSampleRate > 0 ? asbd->mSampleRate : 48000.0;
+        if (st) {
+            st->sampleRate = asbd->mSampleRate > 0 ? asbd->mSampleRate : 44100.0;
             st->channels = asbd->mChannelsPerFrame;
             st->isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
             st->isNonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
@@ -191,20 +311,21 @@ static OSStatus hooked_AudioUnitSetProperty(
     if (inID == kAudioUnitProperty_SetRenderCallback && inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
         const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)inData;
         if (cb->inputProc && (void *)cb->inputProc != (void *)HookedRenderCallback) {
+            // Query StreamFormat OUTSIDE gLock to avoid CoreAudio deadlock
+            AudioStreamBasicDescription asbd;
+            UInt32 sz = sizeof(asbd);
+            bool hasFmt = (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inElement, &asbd, &sz) == noErr);
+
             pthread_mutex_lock(&gLock);
             SpatialUnitState *st = FindOrCreateState(inUnit);
             if (st) {
                 st->origProc = cb->inputProc;
                 st->origRefCon = cb->inputProcRefCon;
-                AudioStreamBasicDescription asbd;
-                UInt32 sz = sizeof(asbd);
-                if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inElement, &asbd, &sz) == noErr) {
-                    if (asbd.mChannelsPerFrame == 2) {
-                        st->sampleRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : 48000.0;
-                        st->channels = asbd.mChannelsPerFrame;
-                        st->isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-                        st->isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-                    }
+                if (hasFmt) {
+                    st->sampleRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : 44100.0;
+                    st->channels = asbd.mChannelsPerFrame;
+                    st->isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+                    st->isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
                 }
                 AURenderCallbackStruct newCb;
                 newCb.inputProc = (AURenderCallback)HookedRenderCallback;
@@ -218,10 +339,25 @@ static OSStatus hooked_AudioUnitSetProperty(
     return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
 }
 
+static OSStatus hooked_AudioComponentInstanceDispose(AudioComponentInstance inInstance) {
+    pthread_mutex_lock(&gLock);
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (gStates[i].valid && gStates[i].unit == (AudioUnit)inInstance) {
+            gStates[i].valid = false;
+            gStates[i].origProc = NULL;
+            gStates[i].unit = NULL;
+        }
+    }
+    pthread_mutex_unlock(&gLock);
+    return orig_AudioComponentInstanceDispose(inInstance);
+}
+
 __attribute__((constructor))
 static void SpatialDSPInit(void) {
+    InitAllSpectra();
     struct rebinding rebinds[] = {
-        { "AudioUnitSetProperty", (void *)hooked_AudioUnitSetProperty, (void **)&orig_AudioUnitSetProperty }
+        { "AudioUnitSetProperty", (void *)hooked_AudioUnitSetProperty, (void **)&orig_AudioUnitSetProperty },
+        { "AudioComponentInstanceDispose", (void *)hooked_AudioComponentInstanceDispose, (void **)&orig_AudioComponentInstanceDispose }
     };
-    rebind_symbols(rebinds, 1);
+    rebind_symbols(rebinds, 2);
 }
