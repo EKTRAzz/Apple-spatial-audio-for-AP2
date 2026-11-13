@@ -190,7 +190,7 @@ static OSStatus hooked_AudioUnitSetProperty(
 
     if (inID == kAudioUnitProperty_SetRenderCallback && inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
         const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)inData;
-        if (cb->inputProc && cb->inputProc != HookedRenderCallback) {
+        if (cb->inputProc && (void *)cb->inputProc != (void *)HookedRenderCallback) {
             pthread_mutex_lock(&gLock);
             SpatialUnitState *st = FindOrCreateState(inUnit);
             if (st) {
@@ -207,7 +207,7 @@ static OSStatus hooked_AudioUnitSetProperty(
                     }
                 }
                 AURenderCallbackStruct newCb;
-                newCb.inputProc = HookedRenderCallback;
+                newCb.inputProc = (AURenderCallback)HookedRenderCallback;
                 newCb.inputProcRefCon = st;
                 pthread_mutex_unlock(&gLock);
                 return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, &newCb, sizeof(newCb));
