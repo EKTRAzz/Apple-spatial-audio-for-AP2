@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -63,8 +64,13 @@ struct SpatialUnitState {
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static SpatialUnitState gStates[MAX_SLOTS];
 static FFTSetup gFftSetup = NULL;
-static atomic_bool gHeadphonesActive = true;
+static atomic_bool gHeadphonesActive = false;
+static atomic_bool gRouteCheckPending = false;
+static atomic_uint gRenderPollCounter = 0;
+static dispatch_queue_t gRouteQueue = NULL;
 static id gRouteObserver = nil;
+static id gResetObserver = nil;
+static id gActiveObserver = nil;
 
 // Precomputed IR spectra (44.1 kHz & 48 kHz)
 struct IRSpectra {
@@ -95,6 +101,7 @@ static void UpdateAudioRouteState(void) {
         AVAudioSessionRouteDescription *route = [session currentRoute];
         NSArray<AVAudioSessionPortDescription *> *outputs = [route outputs];
         if (!outputs || [outputs count] == 0) {
+            atomic_store_explicit(&gHeadphonesActive, false, memory_order_relaxed);
             return;
         }
 
@@ -136,15 +143,64 @@ static void UpdateAudioRouteState(void) {
     }
 }
 
-static void SetupRouteObserver(void) {
-    UpdateAudioRouteState();
-    gRouteObserver = [[NSNotificationCenter defaultCenter]
-        addObserverForName:AVAudioSessionRouteChangeNotification
-                    object:nil
-                     queue:nil
-                usingBlock:^(NSNotification * _Nonnull note) {
-        (void)note;
+static void ScheduleRouteStateRefresh(bool withDelayedRetries) {
+    if (!gRouteQueue) {
+        return;
+    }
+
+    if (!withDelayedRetries) {
+        bool alreadyPending = atomic_exchange_explicit(&gRouteCheckPending, true, memory_order_acq_rel);
+        if (alreadyPending) {
+            return;
+        }
+        dispatch_async(gRouteQueue, ^{
+            UpdateAudioRouteState();
+            atomic_store_explicit(&gRouteCheckPending, false, memory_order_release);
+        });
+        return;
+    }
+
+    dispatch_async(gRouteQueue, ^{
         UpdateAudioRouteState();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)), gRouteQueue, ^{
+        UpdateAudioRouteState();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), gRouteQueue, ^{
+        UpdateAudioRouteState();
+    });
+}
+
+static void SetupRouteObserver(void) {
+    dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+    gRouteQueue = dispatch_queue_create("com.spatialdsp.route", attr);
+
+    UpdateAudioRouteState();
+    ScheduleRouteStateRefresh(true);
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    gRouteObserver = [nc addObserverForName:AVAudioSessionRouteChangeNotification
+                                     object:nil
+                                      queue:nil
+                                 usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
+    }];
+
+    gResetObserver = [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification
+                                     object:nil
+                                      queue:nil
+                                 usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
+    }];
+
+    gActiveObserver = [nc addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                                      object:nil
+                                       queue:nil
+                                  usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
     }];
 }
 
@@ -276,6 +332,12 @@ static OSStatus HookedRenderCallback(
     OSStatus err = st->origProc(st->origRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (err != noErr || !ioData || inNumberFrames == 0) {
         return err;
+    }
+
+    // Periodically trigger a lock-free background route check (~every 32 render callbacks)
+    unsigned int pollCount = atomic_fetch_add_explicit(&gRenderPollCounter, 1u, memory_order_relaxed);
+    if ((pollCount & 31u) == 0u) {
+        ScheduleRouteStateRefresh(false);
     }
 
     const bool isSilence = (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence));
@@ -426,6 +488,7 @@ static OSStatus hooked_AudioUnitSetProperty(
 ) {
     if (inID == kAudioUnitProperty_StreamFormat &&
         inData && inDataSize >= sizeof(AudioStreamBasicDescription)) {
+        ScheduleRouteStateRefresh(true);
         pthread_mutex_lock(&gLock);
         for (int i = 0; i < MAX_SLOTS; i++) {
             if (atomic_load_explicit(&gStates[i].valid, memory_order_relaxed) &&
@@ -437,6 +500,7 @@ static OSStatus hooked_AudioUnitSetProperty(
     } else if ((inID == kAudioUnitProperty_SetRenderCallback || inID == kAudioOutputUnitProperty_SetInputCallback) &&
                inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
         const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)inData;
+        ScheduleRouteStateRefresh(true);
 
         pthread_mutex_lock(&gLock);
         if (cb->inputProc == NULL) {
