@@ -1,7 +1,9 @@
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <Accelerate/Accelerate.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <math.h>
 #include "fishhook.h"
@@ -54,6 +56,7 @@ struct SpatialUnitState {
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static SpatialUnitState gStates[MAX_SLOTS];
 static FFTSetup gFftSetup = NULL;
+static atomic_bool gHeadphonesActive = true;
 
 // Precomputed IR spectra (44.1 kHz & 48 kHz)
 struct IRSpectra {
@@ -77,6 +80,63 @@ static OSStatus (*orig_AudioUnitSetProperty)(
 static OSStatus (*orig_AudioComponentInstanceDispose)(
     AudioComponentInstance inInstance
 ) = NULL;
+
+static void UpdateAudioRouteState(void) {
+    @autoreleasepool {
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        AVAudioSessionRouteDescription *route = [session currentRoute];
+        NSArray<AVAudioSessionPortDescription *> *outputs = [route outputs];
+        if (!outputs || [outputs count] == 0) {
+            return;
+        }
+
+        bool isHeadphone = false;
+        for (AVAudioSessionPortDescription *port in outputs) {
+            NSString *pt = [port portType];
+            NSString *name = [[port portName] lowercaseString] ?: @"";
+
+            // Built-in phone speaker/receiver, CarPlay, AirPlay, HDMI -> always bypass
+            if ([pt isEqualToString:AVAudioSessionPortBuiltInSpeaker] ||
+                [pt isEqualToString:AVAudioSessionPortBuiltInReceiver] ||
+                [pt isEqualToString:AVAudioSessionPortCarAudio] ||
+                [pt isEqualToString:AVAudioSessionPortAirPlay] ||
+                [pt isEqualToString:AVAudioSessionPortHDMI]) {
+                isHeadphone = false;
+                break;
+            }
+
+            // Wired headphones / USB audio
+            if ([pt isEqualToString:AVAudioSessionPortHeadphones] ||
+                [pt isEqualToString:AVAudioSessionPortUSBAudio]) {
+                isHeadphone = true;
+            }
+            // Bluetooth (A2DP / LE / HFP): active unless device name explicitly indicates a speaker or car kit
+            else if ([pt isEqualToString:AVAudioSessionPortBluetoothA2DP] ||
+                     [pt isEqualToString:AVAudioSessionPortBluetoothLE] ||
+                     [pt isEqualToString:AVAudioSessionPortBluetoothHFP]) {
+                if ([name containsString:@"speaker"] ||
+                    [name containsString:@"soundbar"] ||
+                    [name containsString:@"homepod"] ||
+                    [name containsString:@"carplay"]) {
+                    isHeadphone = false;
+                } else {
+                    isHeadphone = true;
+                }
+            }
+        }
+        atomic_store_explicit(&gHeadphonesActive, isHeadphone, memory_order_relaxed);
+    }
+}
+
+static void SetupRouteObserver(void) {
+    UpdateAudioRouteState();
+    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification
+                                                      object:nil
+                                                       queue:nil
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        UpdateAudioRouteState();
+    }];
+}
 
 static void PrecomputeOneIR(const float *ir, float *outR, float *outI) {
     float padded[FFT_N];
@@ -153,7 +213,6 @@ static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32
 
     const IRSpectra *spec = (st->sampleRate >= 46000.0) ? &gSpec48 : &gSpec44;
 
-    // Overlap-Save: shift history left by chunk, append new chunk at end
     memmove(st->histL, st->histL + chunk, (FFT_N - chunk) * sizeof(float));
     memcpy(st->histL + (FFT_N - chunk), inL, chunk * sizeof(float));
 
@@ -172,12 +231,10 @@ static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32
     DSPSplitComplex accL = { st->accLr, st->accLi };
     DSPSplitComplex accR = { st->accRr, st->accRi };
 
-    // L_out = X_L * LL + X_R * RL (summed in frequency domain before single IFFT)
     PackedComplexMul(&xL, spec->ll_r, spec->ll_i, &accL);
     PackedComplexMul(&xR, spec->rl_r, spec->rl_i, &yL);
     vDSP_zvadd(&accL, 1, &yL, 1, &accL, 1, FFT_HALF);
 
-    // R_out = X_L * LR + X_R * RR
     PackedComplexMul(&xL, spec->lr_r, spec->lr_i, &accR);
     PackedComplexMul(&xR, spec->rr_r, spec->rr_i, &yR);
     vDSP_zvadd(&accR, 1, &yR, 1, &accR, 1, FFT_HALF);
@@ -188,7 +245,6 @@ static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32
     vDSP_ztoc(&accL, 1, (DSPComplex *)st->timeOutL, 2, FFT_HALF);
     vDSP_ztoc(&accR, 1, (DSPComplex *)st->timeOutR, 2, FFT_HALF);
 
-    // Scale by 1 / (8 * FFT_N) and copy valid tail [FFT_N - chunk .. FFT_N - 1]
     const float scale = 1.0f / (8.0f * (float)FFT_N);
     float *validL = st->timeOutL + (FFT_N - chunk);
     float *validR = st->timeOutR + (FFT_N - chunk);
@@ -231,6 +287,11 @@ static OSStatus HookedRenderCallback(
     OSStatus err = st->origProc(st->origRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (err != noErr || !ioData || inNumberFrames == 0 || !st->valid || st->channels != 2) return err;
     if (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence)) return err;
+
+    // Auto-Bypass when routed to phone speaker, CarPlay, AirPlay, or Bluetooth speaker
+    if (!atomic_load_explicit(&gHeadphonesActive, memory_order_relaxed)) {
+        return err;
+    }
 
     if (st->isFloat) {
         if (st->isNonInterleaved && ioData->mNumberBuffers >= 2) {
@@ -311,7 +372,7 @@ static OSStatus hooked_AudioUnitSetProperty(
     if (inID == kAudioUnitProperty_SetRenderCallback && inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
         const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)inData;
         if (cb->inputProc && (void *)cb->inputProc != (void *)HookedRenderCallback) {
-            // Query StreamFormat OUTSIDE gLock to avoid CoreAudio deadlock
+            UpdateAudioRouteState();
             AudioStreamBasicDescription asbd;
             UInt32 sz = sizeof(asbd);
             bool hasFmt = (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inElement, &asbd, &sz) == noErr);
@@ -355,6 +416,7 @@ static OSStatus hooked_AudioComponentInstanceDispose(AudioComponentInstance inIn
 __attribute__((constructor))
 static void SpatialDSPInit(void) {
     InitAllSpectra();
+    SetupRouteObserver();
     struct rebinding rebinds[] = {
         { "AudioUnitSetProperty", (void *)hooked_AudioUnitSetProperty, (void **)&orig_AudioUnitSetProperty },
         { "AudioComponentInstanceDispose", (void *)hooked_AudioComponentInstanceDispose, (void **)&orig_AudioComponentInstanceDispose }
