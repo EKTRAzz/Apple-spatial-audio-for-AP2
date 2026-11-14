@@ -7,7 +7,14 @@
 #include <string.h>
 #include <math.h>
 #include "fishhook.h"
+
+#if __has_include("ir_data.c")
+#include "ir_data.c"
+#elif __has_include("ir_data.h")
 #include "ir_data.h"
+#else
+#error "Missing ir_data.c or ir_data.h"
+#endif
 
 #ifndef SPATIAL_MODE
 #define SPATIAL_MODE 1 // 1=HeSuVi Matrix Upmix, 2=Pure Front Stereo
@@ -245,7 +252,7 @@ static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32
     vDSP_ztoc(&accL, 1, (DSPComplex *)st->timeOutL, 2, FFT_HALF);
     vDSP_ztoc(&accR, 1, (DSPComplex *)st->timeOutR, 2, FFT_HALF);
 
-    const float scale = 1.0f / (8.0f * (float)FFT_N);
+    const float scale = 0.630957f / (8.0f * (float)FFT_N); // -4.0 dB headroom
     float *validL = st->timeOutL + (FFT_N - chunk);
     float *validR = st->timeOutR + (FFT_N - chunk);
     vDSP_vsmul(validL, 1, &scale, inL, 1, chunk);
@@ -254,10 +261,10 @@ static void ProcessFFTChunk(SpatialUnitState *st, float *inL, float *inR, UInt32
     for (UInt32 i = 0; i < chunk; i++) {
         float l = inL[i];
         float r = inR[i];
-        if (l > 0.96f) l = 0.96f + 0.03f * tanhf((l - 0.96f) * 33.0f);
-        else if (l < -0.96f) l = -0.96f + 0.03f * tanhf((l + 0.96f) * 33.0f);
-        if (r > 0.96f) r = 0.96f + 0.03f * tanhf((r - 0.96f) * 33.0f);
-        else if (r < -0.96f) r = -0.96f + 0.03f * tanhf((r + 0.96f) * 33.0f);
+        if (l > 0.99f) l = 0.99f + 0.01f * tanhf((l - 0.99f) * 100.0f);
+        else if (l < -0.99f) l = -0.99f + 0.01f * tanhf((l + 0.99f) * 100.0f);
+        if (r > 0.99f) r = 0.99f + 0.01f * tanhf((r - 0.99f) * 100.0f);
+        else if (r < -0.99f) r = -0.99f + 0.01f * tanhf((r + 0.99f) * 100.0f);
         inL[i] = l;
         inR[i] = r;
     }
@@ -361,7 +368,12 @@ static OSStatus hooked_AudioUnitSetProperty(
         pthread_mutex_lock(&gLock);
         SpatialUnitState *st = FindOrCreateState(inUnit);
         if (st) {
-            st->sampleRate = asbd->mSampleRate > 0 ? asbd->mSampleRate : 44100.0;
+            double newRate = asbd->mSampleRate > 0 ? asbd->mSampleRate : 44100.0;
+            if (st->sampleRate != newRate) {
+                memset(st->histL, 0, sizeof(st->histL));
+                memset(st->histR, 0, sizeof(st->histR));
+            }
+            st->sampleRate = newRate;
             st->channels = asbd->mChannelsPerFrame;
             st->isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
             st->isNonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
