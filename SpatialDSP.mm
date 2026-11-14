@@ -64,6 +64,7 @@ static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static SpatialUnitState gStates[MAX_SLOTS];
 static FFTSetup gFftSetup = NULL;
 static atomic_bool gHeadphonesActive = true;
+static __thread int tRenderDepth = 0; // Re-entrancy guard: prevents double convolution in multi-AudioUnit graphs (e.g., Spotify)
 
 // Precomputed IR spectra (44.1 kHz & 48 kHz)
 struct IRSpectra {
@@ -291,7 +292,13 @@ static OSStatus HookedRenderCallback(
     SpatialUnitState *st = (SpatialUnitState *)inRefCon;
     if (!st || !st->origProc) return noErr;
 
+    const bool isOutermost = (tRenderDepth == 0);
+    tRenderDepth++;
     OSStatus err = st->origProc(st->origRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    tRenderDepth--;
+
+    // Only process once at the outermost hooked AudioUnit in the render chain
+    if (!isOutermost) return err;
     if (err != noErr || !ioData || inNumberFrames == 0 || !st->valid || st->channels != 2) return err;
     if (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence)) return err;
 
