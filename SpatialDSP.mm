@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -27,13 +28,15 @@
 
 struct SpatialUnitState {
     AudioUnit unit;
+    AudioUnitElement element;
     AURenderCallback origProc;
     void *origRefCon;
     double sampleRate;
     UInt32 channels;
     bool isFloat;
     bool isNonInterleaved;
-    bool valid;
+    bool wasBypassed;
+    atomic_bool valid;
 
     float histL[FFT_N];
     float histR[FFT_N];
@@ -63,7 +66,13 @@ struct SpatialUnitState {
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static SpatialUnitState gStates[MAX_SLOTS];
 static FFTSetup gFftSetup = NULL;
-static atomic_bool gHeadphonesActive = true;
+static atomic_bool gHeadphonesActive = false;
+static atomic_bool gRouteCheckPending = false;
+static atomic_uint gRenderPollCounter = 0;
+static dispatch_queue_t gRouteQueue = NULL;
+static id gRouteObserver = nil;
+static id gResetObserver = nil;
+static id gActiveObserver = nil;
 static __thread int tRenderDepth = 0; // Re-entrancy guard: prevents double convolution in multi-AudioUnit graphs (e.g., Spotify)
 
 // Precomputed IR spectra (44.1 kHz & 48 kHz)
@@ -95,6 +104,7 @@ static void UpdateAudioRouteState(void) {
         AVAudioSessionRouteDescription *route = [session currentRoute];
         NSArray<AVAudioSessionPortDescription *> *outputs = [route outputs];
         if (!outputs || [outputs count] == 0) {
+            atomic_store_explicit(&gHeadphonesActive, false, memory_order_relaxed);
             return;
         }
 
@@ -136,13 +146,64 @@ static void UpdateAudioRouteState(void) {
     }
 }
 
-static void SetupRouteObserver(void) {
-    UpdateAudioRouteState();
-    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification
-                                                      object:nil
-                                                       queue:nil
-                                                  usingBlock:^(NSNotification * _Nonnull note) {
+static void ScheduleRouteStateRefresh(bool withDelayedRetries) {
+    if (!gRouteQueue) {
+        return;
+    }
+
+    if (!withDelayedRetries) {
+        bool alreadyPending = atomic_exchange_explicit(&gRouteCheckPending, true, memory_order_acq_rel);
+        if (alreadyPending) {
+            return;
+        }
+        dispatch_async(gRouteQueue, ^{
+            UpdateAudioRouteState();
+            atomic_store_explicit(&gRouteCheckPending, false, memory_order_release);
+        });
+        return;
+    }
+
+    dispatch_async(gRouteQueue, ^{
         UpdateAudioRouteState();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)), gRouteQueue, ^{
+        UpdateAudioRouteState();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), gRouteQueue, ^{
+        UpdateAudioRouteState();
+    });
+}
+
+static void SetupRouteObserver(void) {
+    dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+    gRouteQueue = dispatch_queue_create("com.spatialdsp.route", attr);
+
+    UpdateAudioRouteState();
+    ScheduleRouteStateRefresh(true);
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    gRouteObserver = [nc addObserverForName:AVAudioSessionRouteChangeNotification
+                                     object:nil
+                                      queue:nil
+                                 usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
+    }];
+
+    gResetObserver = [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification
+                                     object:nil
+                                      queue:nil
+                                 usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
+    }];
+
+    gActiveObserver = [nc addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                                      object:nil
+                                       queue:nil
+                                  usingBlock:^(NSNotification * _Nonnull note) {
+        (void)note;
+        ScheduleRouteStateRefresh(true);
     }];
 }
 
@@ -183,23 +244,34 @@ static void InitAllSpectra(void) {
 #endif
 }
 
-static SpatialUnitState* FindOrCreateState(AudioUnit unit) {
+static inline void ResetStateHistory(SpatialUnitState *st) {
+    memset(st->histL, 0, sizeof(st->histL));
+    memset(st->histR, 0, sizeof(st->histR));
+}
+
+static SpatialUnitState* FindOrCreateState(AudioUnit unit, AudioUnitElement element) {
+    SpatialUnitState *freeSlot = NULL;
     for (int i = 0; i < MAX_SLOTS; i++) {
-        if (gStates[i].valid && gStates[i].unit == unit) return &gStates[i];
-    }
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        if (!gStates[i].valid) {
-            memset(&gStates[i], 0, sizeof(SpatialUnitState));
-            gStates[i].unit = unit;
-            gStates[i].sampleRate = 44100.0;
-            gStates[i].channels = 2;
-            gStates[i].isFloat = true;
-            gStates[i].isNonInterleaved = true;
-            gStates[i].valid = true;
+        bool v = atomic_load_explicit(&gStates[i].valid, memory_order_relaxed);
+        if (v && gStates[i].unit == unit && gStates[i].element == element) {
             return &gStates[i];
         }
+        if (!v && !freeSlot) {
+            freeSlot = &gStates[i];
+        }
     }
-    return NULL;
+    if (freeSlot) {
+        memset(freeSlot, 0, sizeof(SpatialUnitState));
+        freeSlot->unit = unit;
+        freeSlot->element = element;
+        freeSlot->sampleRate = 44100.0;
+        freeSlot->channels = 2;
+        freeSlot->isFloat = true;
+        freeSlot->isNonInterleaved = true;
+        freeSlot->wasBypassed = false;
+        atomic_store_explicit(&freeSlot->valid, true, memory_order_release);
+    }
+    return freeSlot;
 }
 
 static inline void PackedComplexMul(
@@ -290,7 +362,9 @@ static OSStatus HookedRenderCallback(
     AudioBufferList *ioData
 ) {
     SpatialUnitState *st = (SpatialUnitState *)inRefCon;
-    if (!st || !st->origProc) return noErr;
+    if (!st || !atomic_load_explicit(&st->valid, memory_order_acquire) || !st->origProc) {
+        return noErr;
+    }
 
     const bool isOutermost = (tRenderDepth == 0);
     tRenderDepth++;
@@ -299,13 +373,26 @@ static OSStatus HookedRenderCallback(
 
     // Only process once at the outermost hooked AudioUnit in the render chain
     if (!isOutermost) return err;
-    if (err != noErr || !ioData || inNumberFrames == 0 || !st->valid || st->channels != 2) return err;
-    if (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence)) return err;
+    if (err != noErr || !ioData || inNumberFrames == 0 || st->channels != 2) return err;
 
-    // Auto-Bypass when routed to phone speaker, CarPlay, AirPlay, or Bluetooth speaker
-    if (!atomic_load_explicit(&gHeadphonesActive, memory_order_relaxed)) {
+    // Periodically trigger a lock-free background route check (~every 32 render callbacks)
+    unsigned int pollCount = atomic_fetch_add_explicit(&gRenderPollCounter, 1u, memory_order_relaxed);
+    if ((pollCount & 31u) == 0u) {
+        ScheduleRouteStateRefresh(false);
+    }
+
+    const bool isSilence = (ioActionFlags && (*ioActionFlags & kAudioUnitRenderAction_OutputIsSilence));
+    const bool active = atomic_load_explicit(&gHeadphonesActive, memory_order_relaxed);
+
+    // Auto-Bypass when routed to iPhone speaker, CarPlay, AirPlay, or Bluetooth speaker
+    if (!active || isSilence) {
+        if (!st->wasBypassed) {
+            ResetStateHistory(st);
+            st->wasBypassed = true;
+        }
         return err;
     }
+    st->wasBypassed = false;
 
     if (st->isFloat) {
         if (st->isNonInterleaved && ioData->mNumberBuffers >= 2) {
@@ -372,13 +459,13 @@ static OSStatus hooked_AudioUnitSetProperty(
 ) {
     if (inID == kAudioUnitProperty_StreamFormat && inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AudioStreamBasicDescription)) {
         const AudioStreamBasicDescription *asbd = (const AudioStreamBasicDescription *)inData;
+        ScheduleRouteStateRefresh(true);
         pthread_mutex_lock(&gLock);
-        SpatialUnitState *st = FindOrCreateState(inUnit);
+        SpatialUnitState *st = FindOrCreateState(inUnit, inElement);
         if (st) {
             double newRate = asbd->mSampleRate > 0 ? asbd->mSampleRate : 44100.0;
-            if (st->sampleRate != newRate) {
-                memset(st->histL, 0, sizeof(st->histL));
-                memset(st->histR, 0, sizeof(st->histR));
+            if (st->sampleRate != newRate || st->channels != asbd->mChannelsPerFrame) {
+                ResetStateHistory(st);
             }
             st->sampleRate = newRate;
             st->channels = asbd->mChannelsPerFrame;
@@ -388,16 +475,30 @@ static OSStatus hooked_AudioUnitSetProperty(
         pthread_mutex_unlock(&gLock);
     }
 
-    if (inID == kAudioUnitProperty_SetRenderCallback && inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
+    if ((inID == kAudioUnitProperty_SetRenderCallback || inID == kAudioOutputUnitProperty_SetInputCallback) &&
+        inScope == kAudioUnitScope_Input && inData && inDataSize >= sizeof(AURenderCallbackStruct)) {
         const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)inData;
-        if (cb->inputProc && (void *)cb->inputProc != (void *)HookedRenderCallback) {
-            UpdateAudioRouteState();
+        ScheduleRouteStateRefresh(true);
+
+        if (cb->inputProc == NULL) {
+            pthread_mutex_lock(&gLock);
+            for (int i = 0; i < MAX_SLOTS; i++) {
+                if (atomic_load_explicit(&gStates[i].valid, memory_order_relaxed) &&
+                    gStates[i].unit == inUnit && gStates[i].element == inElement) {
+                    atomic_store_explicit(&gStates[i].valid, false, memory_order_release);
+                }
+            }
+            pthread_mutex_unlock(&gLock);
+            return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
+        }
+
+        if ((void *)cb->inputProc != (void *)HookedRenderCallback) {
             AudioStreamBasicDescription asbd;
             UInt32 sz = sizeof(asbd);
             bool hasFmt = (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inElement, &asbd, &sz) == noErr);
 
             pthread_mutex_lock(&gLock);
-            SpatialUnitState *st = FindOrCreateState(inUnit);
+            SpatialUnitState *st = FindOrCreateState(inUnit, inElement);
             if (st) {
                 st->origProc = cb->inputProc;
                 st->origRefCon = cb->inputProcRefCon;
@@ -422,8 +523,9 @@ static OSStatus hooked_AudioUnitSetProperty(
 static OSStatus hooked_AudioComponentInstanceDispose(AudioComponentInstance inInstance) {
     pthread_mutex_lock(&gLock);
     for (int i = 0; i < MAX_SLOTS; i++) {
-        if (gStates[i].valid && gStates[i].unit == (AudioUnit)inInstance) {
-            gStates[i].valid = false;
+        if (atomic_load_explicit(&gStates[i].valid, memory_order_relaxed) &&
+            gStates[i].unit == (AudioUnit)inInstance) {
+            atomic_store_explicit(&gStates[i].valid, false, memory_order_release);
             gStates[i].origProc = NULL;
             gStates[i].unit = NULL;
         }
@@ -434,11 +536,12 @@ static OSStatus hooked_AudioComponentInstanceDispose(AudioComponentInstance inIn
 
 __attribute__((constructor))
 static void SpatialDSPInit(void) {
+    memset(gStates, 0, sizeof(gStates));
     InitAllSpectra();
     SetupRouteObserver();
-    struct rebinding rebinds[] = {
+    struct rebinding rebindings[] = {
         { "AudioUnitSetProperty", (void *)hooked_AudioUnitSetProperty, (void **)&orig_AudioUnitSetProperty },
         { "AudioComponentInstanceDispose", (void *)hooked_AudioComponentInstanceDispose, (void **)&orig_AudioComponentInstanceDispose }
     };
-    rebind_symbols(rebinds, 2);
+    rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
 }
