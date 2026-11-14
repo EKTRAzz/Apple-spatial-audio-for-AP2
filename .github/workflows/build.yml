@@ -1,25 +1,42 @@
-name: Build ApplePro2 SpatialDSP dylibs
+name: Build iOS Spatial DSP dylib
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Fetch fishhook
-        run: git clone --depth 1 https://github.com/facebook/fishhook.git
+      - name: Fetch fishhook if not present
+        run: |
+          if [ ! -f fishhook/fishhook.c ]; then
+            git clone --depth 1 https://github.com/facebook/fishhook.git fishhook
+          fi
 
-      - name: Build ARM64 iOS dylibs
-        run: make
+      - name: Compile SpatialDSP dylibs (Direct clang++, no Makefile Tab issues)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=15.0 -O3 -fobjc-arc -dynamiclib"
+          LIBS="-framework Foundation -framework AVFoundation -framework AudioToolbox -framework Accelerate"
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -O3 -c fishhook/fishhook.c -o fishhook.o
+
+          xcrun --sdk iphoneos clang++ $FLAGS -install_name @rpath/SpatialDSP_ApplePro2_Matrix.dylib -DSPATIAL_MODE=1 -Ifishhook SpatialDSP.mm fishhook.o $LIBS -o SpatialDSP_ApplePro2_Matrix.dylib
+
+          xcrun --sdk iphoneos clang++ $FLAGS -install_name @rpath/SpatialDSP_ApplePro2_Front.dylib -DSPATIAL_MODE=2 -Ifishhook SpatialDSP.mm fishhook.o $LIBS -o SpatialDSP_ApplePro2_Front.dylib
+
+          codesign -s - --force SpatialDSP_ApplePro2_Matrix.dylib SpatialDSP_ApplePro2_Front.dylib
+          ls -lh *.dylib
 
       - name: Upload dylib artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ApplePro2-SpatialDSP-dylibs
-          path: "*.dylib"
+          name: SpatialDSP_ApplePro2_dylibs
+          path: |
+            SpatialDSP_ApplePro2_Matrix.dylib
+            SpatialDSP_ApplePro2_Front.dylib
